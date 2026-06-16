@@ -47,4 +47,19 @@ mvn clean package
 # результат: target/netmonitor.jar
 ```
 
+## Автоматический релиз (GitHub Actions)
+
+В репозитории настроены два workflow:
+- **Build** — собирает JAR при каждом пуше в `main` (артефакт можно скачать со страницы Actions).
+- **Build & Release** — при пуше тега `v*` собирает JAR и автоматически создаёт GitHub Release с прикреплённым файлом.
+
+Чтобы выпустить релиз, создай и запушь тег:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+После этого во вкладке **Releases** появится `NetMonitor v1.0.0` с готовым `netmonitor.jar`.
+
 Конфиги хранятся в `~/.netmonitor/` (`settings.properties`, `rules.tsv`).

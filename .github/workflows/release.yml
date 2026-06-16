@@ -1,0 +1,52 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build JAR
+        run: mvn -B -q clean package
+
+      - name: Rename artifact with version
+        run: |
+          mkdir -p out
+          cp target/netmonitor.jar out/netmonitor.jar
+          if [ -n "${GITHUB_REF_NAME}" ]; then
+            cp target/netmonitor.jar "out/netmonitor-${GITHUB_REF_NAME}.jar" || true
+          fi
+          ls -la out
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netmonitor-jar
+          path: out/*.jar
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NetMonitor ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            out/netmonitor.jar
+            out/netmonitor-${{ github.ref_name }}.jar

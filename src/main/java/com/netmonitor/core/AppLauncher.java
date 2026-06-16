@@ -9,7 +9,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -69,10 +75,76 @@ public final class AppLauncher {
 
     private final List<Launched> launched = new CopyOnWriteArrayList<>();
 
+    /** Слушатели появления нового дочернего процесса: (родитель, дескриптор ребёнка). */
+    private final List<BiConsumer<Launched, ProcessHandle>> childListeners = new CopyOnWriteArrayList<>();
+    /** Уже известные дочерние PID, чтобы не сообщать о них повторно. */
+    private final Set<Long> knownChildren = ConcurrentHashMap.newKeySet();
+    private ScheduledExecutorService watcher;
+
     public List<Launched> getLaunched() {
         // чистим завершённые
         launched.removeIf(l -> !l.isAlive());
         return new ArrayList<>(launched);
+    }
+
+    public void addChildListener(BiConsumer<Launched, ProcessHandle> listener) {
+        childListeners.add(listener);
+    }
+
+    /**
+     * Запускает фоновое наблюдение за дочерними процессами запущенных приложений.
+     * Когда приложение порождает новый процесс (например, браузер открывает рендерер
+     * или хелпер), он обнаруживается здесь. Так как дочерние процессы наследуют
+     * окружение родителя (включая HTTP(S)_PROXY), их трафик уже идёт через прокси.
+     */
+    public synchronized void startChildWatcher() {
+        if (watcher != null) {
+            return;
+        }
+        watcher = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "child-watcher");
+            t.setDaemon(true);
+            return t;
+        });
+        watcher.scheduleWithFixedDelay(this::scanChildren, 1, 1, TimeUnit.SECONDS);
+        AppLogger.get().info(SRC, "Наблюдение за дочерними процессами запущено");
+    }
+
+    private void scanChildren() {
+        try {
+            for (Launched l : launched) {
+                if (!l.isAlive()) {
+                    continue;
+                }
+                l.getProcess().descendants().forEach(ph -> {
+                    if (knownChildren.add(ph.pid())) {
+                        String cmd = ph.info().commandLine()
+                                .orElse(ph.info().command().orElse("?"));
+                        AppLogger.get().info(SRC, "ДЕТЕКТ дочернего процесса: родитель pid="
+                                + l.pid() + " -> ребёнок pid=" + ph.pid() + " : " + cmd
+                                + " (перехват через унаследованный прокси)");
+                        for (BiConsumer<Launched, ProcessHandle> listener : childListeners) {
+                            try {
+                                listener.accept(l, ph);
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    }
+                });
+            }
+        } catch (Exception e) {
+            AppLogger.get().debug(SRC, "Ошибка сканирования дочерних процессов: " + e.getMessage());
+        }
+    }
+
+    /** Все потомки запущенного процесса (рекурсивно), снимок на текущий момент. */
+    public List<ProcessHandle> descendants(Launched l) {
+        List<ProcessHandle> out = new ArrayList<>();
+        try {
+            l.getProcess().descendants().forEach(out::add);
+        } catch (Exception ignored) {
+        }
+        return out;
     }
 
     /**
@@ -153,6 +225,10 @@ public final class AppLauncher {
             }
         }
         launched.clear();
+        if (watcher != null) {
+            watcher.shutdownNow();
+            watcher = null;
+        }
     }
 
     /** Делит строку аргументов по пробелам с поддержкой кавычек. */

@@ -50,6 +50,16 @@ public final class LaunchPanel extends JPanel {
 
         presets.addActionListener(e -> applyPreset());
 
+        // детект дочерних процессов: лог + обновление таблицы
+        launcher.startChildWatcher();
+        launcher.addChildListener((parent, child) -> SwingUtilities.invokeLater(() -> {
+            String cmd = child.info().commandLine().orElse(child.info().command().orElse("?"));
+            appendOutput("[ДЕТЕКТ] приложение pid=" + parent.pid()
+                    + " запустило дочерний процесс pid=" + child.pid()
+                    + " : " + cmd + "  → перехват включён (наследует прокси)");
+            refreshProcesses();
+        }));
+
         // периодически обновляем таблицу процессов
         Timer timer = new Timer(2000, e -> refreshProcesses());
         timer.start();
@@ -210,16 +220,33 @@ public final class LaunchPanel extends JPanel {
         if (row < 0) {
             return;
         }
-        AppLauncher.Launched l = procModel.get(row);
-        if (l != null) {
-            l.forceStop();
-            appendOutput("[остановлен процесс pid=" + l.pid() + "]");
-            refreshProcesses();
+        ProcRow r = procModel.get(row);
+        if (r == null) {
+            return;
         }
+        if (r.launched != null) {
+            r.launched.forceStop();
+            appendOutput("[остановлен процесс pid=" + r.pid + "]");
+        } else if (r.handle != null) {
+            r.handle.destroyForcibly();
+            appendOutput("[остановлен дочерний процесс pid=" + r.pid + "]");
+        }
+        refreshProcesses();
     }
 
     private void refreshProcesses() {
-        procModel.setData(launcher.getLaunched());
+        List<ProcRow> rows = new java.util.ArrayList<>();
+        for (AppLauncher.Launched l : launcher.getLaunched()) {
+            rows.add(new ProcRow(l.pid(), -1, "родитель", l.getCommand(),
+                    l.isAlive() ? "работает" : "завершён", l, null));
+            for (ProcessHandle child : launcher.descendants(l)) {
+                long ppid = child.parent().map(ProcessHandle::pid).orElse(l.pid());
+                String cmd = child.info().commandLine().orElse(child.info().command().orElse("?"));
+                rows.add(new ProcRow(child.pid(), ppid, "дочерний", cmd,
+                        child.isAlive() ? "работает" : "завершён", null, child));
+            }
+        }
+        procModel.setData(rows);
         updateStatus();
     }
 
@@ -229,27 +256,37 @@ public final class LaunchPanel extends JPanel {
     }
 
     private void updateStatus() {
+        int parents = launcher.getLaunched().size();
+        int children = 0;
+        for (AppLauncher.Launched l : launcher.getLaunched()) {
+            children += launcher.descendants(l).size();
+        }
         status.setText((proxy.isRunning()
                 ? "Прокси РАБОТАЕТ на 127.0.0.1:" + proxy.getPort()
                 : "Прокси остановлен — поднимется при запуске приложения")
-                + " | активных процессов: " + launcher.getLaunched().size());
+                + " | процессов: " + parents + " (+ дочерних: " + children + ", перехват наследуется)");
     }
 
     public void shutdown() {
         launcher.stopAll();
     }
 
+    /** Строка таблицы процессов: запущенный родитель или его потомок. */
+    private record ProcRow(long pid, long ppid, String type, String command, String status,
+                           AppLauncher.Launched launched, ProcessHandle handle) {
+    }
+
     // -------------------- модель таблицы процессов --------------------
     private static final class ProcTableModel extends AbstractTableModel {
-        private final String[] cols = {"PID", "Команда", "Статус"};
-        private List<AppLauncher.Launched> data = new java.util.ArrayList<>();
+        private final String[] cols = {"PID", "PPID", "Тип", "Команда", "Статус"};
+        private List<ProcRow> data = new java.util.ArrayList<>();
 
-        void setData(List<AppLauncher.Launched> d) {
+        void setData(List<ProcRow> d) {
             this.data = d;
             fireTableDataChanged();
         }
 
-        AppLauncher.Launched get(int row) {
+        ProcRow get(int row) {
             return row >= 0 && row < data.size() ? data.get(row) : null;
         }
 
@@ -270,11 +307,13 @@ public final class LaunchPanel extends JPanel {
 
         @Override
         public Object getValueAt(int r, int c) {
-            AppLauncher.Launched l = data.get(r);
+            ProcRow row = data.get(r);
             return switch (c) {
-                case 0 -> l.pid();
-                case 1 -> l.getCommand();
-                case 2 -> l.isAlive() ? "работает" : "завершён";
+                case 0 -> row.pid();
+                case 1 -> row.ppid() < 0 ? "" : row.ppid();
+                case 2 -> row.type();
+                case 3 -> row.command();
+                case 4 -> row.status();
                 default -> "";
             };
         }

@@ -15,7 +15,6 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -75,10 +74,16 @@ public final class AppLauncher {
 
     private final List<Launched> launched = new CopyOnWriteArrayList<>();
 
-    /** Слушатели появления нового дочернего процесса: (родитель, дескриптор ребёнка). */
-    private final List<BiConsumer<Launched, ProcessHandle>> childListeners = new CopyOnWriteArrayList<>();
-    /** Уже известные дочерние PID, чтобы не сообщать о них повторно. */
-    private final Set<Long> knownChildren = ConcurrentHashMap.newKeySet();
+    /** Обнаруженный процесс, связанный с отслеживаемым приложением. */
+    public record Detected(long pid, long openedByPid, String command, String linkInfo) {
+    }
+
+    /** Слушатели обнаружения нового процесса, связанного с отслеживаемым приложением. */
+    private final List<Consumer<Detected>> processListeners = new CopyOnWriteArrayList<>();
+    /** PID-ы, относящиеся к отслеживаемому "дереву" (запущенные нами + транзитивно связанные). */
+    private final Set<Long> trackedPids = ConcurrentHashMap.newKeySet();
+    /** Уже обработанные PID, чтобы не сообщать повторно. */
+    private final Set<Long> reportedPids = ConcurrentHashMap.newKeySet();
     private ScheduledExecutorService watcher;
 
     public List<Launched> getLaunched() {
@@ -87,54 +92,108 @@ public final class AppLauncher {
         return new ArrayList<>(launched);
     }
 
-    public void addChildListener(BiConsumer<Launched, ProcessHandle> listener) {
-        childListeners.add(listener);
+    public void addProcessListener(Consumer<Detected> listener) {
+        processListeners.add(listener);
     }
 
     /**
-     * Запускает фоновое наблюдение за дочерними процессами запущенных приложений.
-     * Когда приложение порождает новый процесс (например, браузер открывает рендерер
-     * или хелпер), он обнаруживается здесь. Так как дочерние процессы наследуют
-     * окружение родителя (включая HTTP(S)_PROXY), их трафик уже идёт через прокси.
+     * Запускает фоновое наблюдение за процессами.
+     * <p>
+     * В отличие от простого обхода дерева потомков, здесь сканируются ВСЕ процессы
+     * системы, и новый процесс считается "нашим", если в цепочке его предков есть
+     * любой уже отслеживаемый PID. Это позволяет ловить случаи, когда одно
+     * приложение запускает ДРУГОЕ приложение, которое затем "отвязывается" от
+     * родителя (классический паттерн bootstrapper -> launcher, где лаунчер
+     * переподвязывается к init/explorer). Однажды обнаруженный процесс остаётся
+     * отслеживаемым, поэтому связь не теряется даже после завершения промежуточного
+     * (bootstrapper) процесса.
+     * <p>
+     * Перехват трафика таких процессов работает автоматически: окружение (включая
+     * HTTP(S)_PROXY) копируется при exec и наследуется по всей цепочке запусков,
+     * независимо от переподвязки в дереве процессов.
      */
-    public synchronized void startChildWatcher() {
+    public synchronized void startProcessWatcher() {
         if (watcher != null) {
             return;
         }
         watcher = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "child-watcher");
+            Thread t = new Thread(r, "process-watcher");
             t.setDaemon(true);
             return t;
         });
-        watcher.scheduleWithFixedDelay(this::scanChildren, 1, 1, TimeUnit.SECONDS);
-        AppLogger.get().info(SRC, "Наблюдение за дочерними процессами запущено");
+        watcher.scheduleWithFixedDelay(this::scanProcesses, 1, 1, TimeUnit.SECONDS);
+        AppLogger.get().info(SRC, "Наблюдение за процессами запущено (детект открытых приложений)");
     }
 
-    private void scanChildren() {
+    private void scanProcesses() {
         try {
+            // гарантируем, что запущенные нами процессы помечены как отслеживаемые
             for (Launched l : launched) {
-                if (!l.isAlive()) {
-                    continue;
+                if (l.isAlive()) {
+                    trackedPids.add(l.pid());
                 }
-                l.getProcess().descendants().forEach(ph -> {
-                    if (knownChildren.add(ph.pid())) {
-                        String cmd = ph.info().commandLine()
-                                .orElse(ph.info().command().orElse("?"));
-                        AppLogger.get().info(SRC, "ДЕТЕКТ дочернего процесса: родитель pid="
-                                + l.pid() + " -> ребёнок pid=" + ph.pid() + " : " + cmd
-                                + " (перехват через унаследованный прокси)");
-                        for (BiConsumer<Launched, ProcessHandle> listener : childListeners) {
-                            try {
-                                listener.accept(l, ph);
-                            } catch (Exception ignored) {
-                            }
+            }
+            ProcessHandle.allProcesses().forEach(ph -> {
+                long pid = ph.pid();
+                if (reportedPids.contains(pid) || trackedPids.contains(pid)) {
+                    return;
+                }
+                long ancestor = linkedAncestor(ph);
+                if (ancestor > 0) {
+                    trackedPids.add(pid);
+                    reportedPids.add(pid);
+                    long ppid = ph.parent().map(ProcessHandle::pid).orElse(-1L);
+                    String cmd = ph.info().commandLine().orElse(ph.info().command().orElse("?"));
+                    String link = (ppid == ancestor)
+                            ? "запущено процессом pid=" + ancestor
+                            : "связано с отслеживаемым процессом pid=" + ancestor + " (через цепочку)";
+                    AppLogger.get().info(SRC, "ДЕТЕКТ приложения: pid=" + pid
+                            + " ppid=" + ppid + " : " + cmd + " — " + link
+                            + " (перехват через унаследованный прокси)");
+                    Detected d = new Detected(pid, ancestor, cmd, link);
+                    for (Consumer<Detected> listener : processListeners) {
+                        try {
+                            listener.accept(d);
+                        } catch (Exception ignored) {
                         }
                     }
-                });
-            }
+                }
+            });
         } catch (Exception e) {
-            AppLogger.get().debug(SRC, "Ошибка сканирования дочерних процессов: " + e.getMessage());
+            AppLogger.get().debug(SRC, "Ошибка сканирования процессов: " + e.getMessage());
         }
+    }
+
+    /** Возвращает PID отслеживаемого предка в цепочке, либо -1, если связи нет. */
+    private long linkedAncestor(ProcessHandle ph) {
+        ProcessHandle cur = ph;
+        for (int depth = 0; depth < 40; depth++) {
+            ProcessHandle parent = cur.parent().orElse(null);
+            if (parent == null) {
+                return -1;
+            }
+            if (trackedPids.contains(parent.pid())) {
+                return parent.pid();
+            }
+            cur = parent;
+        }
+        return -1;
+    }
+
+    /** Все отслеживаемые процессы, открытые приложениями (без тех, что мы запускали сами). */
+    public List<ProcessHandle> getDetectedProcesses() {
+        List<ProcessHandle> out = new ArrayList<>();
+        Set<Long> launchedPids = new java.util.HashSet<>();
+        for (Launched l : launched) {
+            launchedPids.add(l.pid());
+        }
+        for (Long pid : trackedPids) {
+            if (launchedPids.contains(pid)) {
+                continue;
+            }
+            ProcessHandle.of(pid).filter(ProcessHandle::isAlive).ifPresent(out::add);
+        }
+        return out;
     }
 
     /** Все потомки запущенного процесса (рекурсивно), снимок на текущий момент. */
@@ -187,6 +246,9 @@ public final class AppLauncher {
         Process process = pb.start();
         Launched l = new Launched(String.join(" ", command), process);
         launched.add(l);
+        // помечаем как корень отслеживаемого дерева и не сообщаем о нём как о "стороннем"
+        trackedPids.add(l.pid());
+        reportedPids.add(l.pid());
 
         // читаем вывод процесса в отдельном потоке
         Thread reader = new Thread(() -> {

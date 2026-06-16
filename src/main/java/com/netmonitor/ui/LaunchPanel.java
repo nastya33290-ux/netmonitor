@@ -50,13 +50,12 @@ public final class LaunchPanel extends JPanel {
 
         presets.addActionListener(e -> applyPreset());
 
-        // детект дочерних процессов: лог + обновление таблицы
-        launcher.startChildWatcher();
-        launcher.addChildListener((parent, child) -> SwingUtilities.invokeLater(() -> {
-            String cmd = child.info().commandLine().orElse(child.info().command().orElse("?"));
-            appendOutput("[ДЕТЕКТ] приложение pid=" + parent.pid()
-                    + " запустило дочерний процесс pid=" + child.pid()
-                    + " : " + cmd + "  → перехват включён (наследует прокси)");
+        // детект СТОРОННИХ приложений, открытых отслеживаемым (bootstrapper -> launcher и т.п.)
+        launcher.startProcessWatcher();
+        launcher.addProcessListener(d -> SwingUtilities.invokeLater(() -> {
+            appendOutput("[ДЕТЕКТ] обнаружено приложение pid=" + d.pid()
+                    + " (" + d.linkInfo() + ") : " + d.command()
+                    + "  → перехват включён (наследует прокси)");
             refreshProcesses();
         }));
 
@@ -237,14 +236,15 @@ public final class LaunchPanel extends JPanel {
     private void refreshProcesses() {
         List<ProcRow> rows = new java.util.ArrayList<>();
         for (AppLauncher.Launched l : launcher.getLaunched()) {
-            rows.add(new ProcRow(l.pid(), -1, "родитель", l.getCommand(),
+            rows.add(new ProcRow(l.pid(), -1, "запущено нами", l.getCommand(),
                     l.isAlive() ? "работает" : "завершён", l, null));
-            for (ProcessHandle child : launcher.descendants(l)) {
-                long ppid = child.parent().map(ProcessHandle::pid).orElse(l.pid());
-                String cmd = child.info().commandLine().orElse(child.info().command().orElse("?"));
-                rows.add(new ProcRow(child.pid(), ppid, "дочерний", cmd,
-                        child.isAlive() ? "работает" : "завершён", null, child));
-            }
+        }
+        // сторонние приложения, открытые отслеживаемым (bootstrapper -> launcher и т.п.)
+        for (ProcessHandle ph : launcher.getDetectedProcesses()) {
+            long ppid = ph.parent().map(ProcessHandle::pid).orElse(-1L);
+            String cmd = ph.info().commandLine().orElse(ph.info().command().orElse("?"));
+            rows.add(new ProcRow(ph.pid(), ppid, "открыто приложением", cmd,
+                    ph.isAlive() ? "работает" : "завершён", null, ph));
         }
         procModel.setData(rows);
         updateStatus();
@@ -257,14 +257,12 @@ public final class LaunchPanel extends JPanel {
 
     private void updateStatus() {
         int parents = launcher.getLaunched().size();
-        int children = 0;
-        for (AppLauncher.Launched l : launcher.getLaunched()) {
-            children += launcher.descendants(l).size();
-        }
+        int detected = launcher.getDetectedProcesses().size();
         status.setText((proxy.isRunning()
                 ? "Прокси РАБОТАЕТ на 127.0.0.1:" + proxy.getPort()
                 : "Прокси остановлен — поднимется при запуске приложения")
-                + " | процессов: " + parents + " (+ дочерних: " + children + ", перехват наследуется)");
+                + " | запущено: " + parents
+                + " | открыто приложениями (перехват наследуется): " + detected);
     }
 
     public void shutdown() {

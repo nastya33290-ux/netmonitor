@@ -20,6 +20,7 @@ public final class MainFrame extends JFrame {
     private final ConnectionMonitor monitor;
     private final RuleEngine ruleEngine;
     private final ProxyServer proxy;
+    private LaunchPanel launchPanelRef;
 
     public MainFrame() {
         super("NetMonitor — мониторинг соединений и HTTP(S) запросов");
@@ -42,6 +43,8 @@ public final class MainFrame extends JFrame {
 
         ConnectionsPanel connectionsPanel = new ConnectionsPanel(monitor);
         ProxyPanel proxyPanel = new ProxyPanel(proxy, ruleEngine, settings);
+        LaunchPanel launchPanel = new LaunchPanel(proxy, settings);
+        this.launchPanelRef = launchPanel;
         RequestSenderPanel senderPanel = new RequestSenderPanel(settings);
         RulesPanel rulesPanel = new RulesPanel(ruleEngine);
         SettingsPanel settingsPanel = new SettingsPanel(settings);
@@ -53,9 +56,11 @@ public final class MainFrame extends JFrame {
             tabs.setSelectedComponent(senderPanel);
         });
         proxyPanel.setRulesChangedCallback(rulesPanel::reload);
+        launchPanel.setOpenProxyTab(() -> tabs.setSelectedComponent(proxyPanel));
 
         tabs.addTab("Соединения", connectionsPanel);
         tabs.addTab("Прокси / Перехват", proxyPanel);
+        tabs.addTab("Запуск через прокси", launchPanel);
         tabs.addTab("Отправить запрос", senderPanel);
         tabs.addTab("Правила блокировки", rulesPanel);
         tabs.addTab("Настройки", settingsPanel);
@@ -98,6 +103,12 @@ public final class MainFrame extends JFrame {
             return;
         }
         AppLogger.get().info("MainFrame", "Завершение работы...");
+        try {
+            if (launchPanelRef != null) {
+                launchPanelRef.shutdown();
+            }
+        } catch (Exception ignored) {
+        }
         try {
             proxy.stop();
         } catch (Exception ignored) {
